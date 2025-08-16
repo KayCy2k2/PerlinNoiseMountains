@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Perlin Noise Mountains — Three.js r128</title>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            background: #0b1020;
+            color: #e7f2ff;
+            font-family: system-ui, Roboto, sans-serif;
+        }
+
+        #app {
+            position: fixed;
+            inset: 0;
+        }
+
+        .badge {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            padding: 6px 10px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(8px);
+            border-radius: 10px;
+            font-size: 12px;
+        }
+    </style>
+
+    <!-- Three.js / Controls / dat.GUI -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Water.js"></script>
+</head>
+
+<body>
+    <div id="app"></div>
+    <div class="badge">Perlin Mountains • Three.js r128</div>
+    <input type="file" id="textureInput" accept="image/*" style="display:none">
+    <canvas id="minimap" width="200" height="200"
+        style="position: absolute; right: 20px; bottom: 20px; border:1px solid #fff; background:#111; cursor:pointer;"></canvas>
+
+    <script>
+        // ===== Seeded random helper =====
+        function xorshift32(seed) {
+            let x = seed >>> 0;
+            return function () {
+                // xorshift
+                x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+                // to [0,1)
+                return ((x >>> 0) / 4294967296);
+            };
+        }
+
+        // ===== Perlin Noise (2D), seeded =====
+        function makePerlin2D(seed = 12345) {
+            const rand = xorshift32(seed || 1);
+            const p = new Uint8Array(512);
+            const perm = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) perm[i] = i;
+            // Fisher-Yates shuffle using seeded rng
+            for (let i = 255; i > 0; i--) {
+                const j = Math.floor(rand() * (i + 1));
+                const tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+            }
+            for (let i = 0; i < 512; i++) p[i] = perm[i & 255];
+
+            const Gx = new Float32Array(512);
+            const Gy = new Float32Array(512);
+            for (let i = 0; i < 512; i++) {
+                // Random unit gradients
+                const a = rand() * Math.PI * 2;
+                Gx[i] = Math.cos(a);
+                Gy[i] = Math.sin(a);
+            }
+
+            function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+            function lerp(a, b, t) { return a + (b - a) * t; }
+            function grad(ix, iy, x, y) {
+                const idx = p[ix + p[iy]];
+                return Gx[idx] * x + Gy[idx] * y;
+            }
+
+            function noise(x, y) {
+                const X = Math.floor(x) & 255;
+                const Y = Math.floor(y) & 255;
+                const xf = x - Math.floor(x);
+                const yf = y - Math.floor(y);
+
+                const u = fade(xf);
+                const v = fade(yf);
+
+                const n00 = grad(X, Y, xf, yf);
+                const n10 = grad(X + 1, Y, xf - 1, yf);
+                const n01 = grad(X, Y + 1, xf, yf - 1);
+                const n11 = grad(X + 1, Y + 1, xf - 1, yf - 1);
+
+                const nx0 = lerp(n00, n10, u);
+                const nx1 = lerp(n01, n11, u);
+                const nxy = lerp(nx0, nx1, v);
+                return nxy; // in ~[-1,1]
+            }
+
+            return { noise };
+        }
+
+        // fBm (fractal Brownian motion) using Perlin
+        function fbm2(perlin, x, y, octaves = 4, lacunarity = 2.0, gain = 0.5) {
+            let amp = 0.5, freq = 1.0, sum = 0.0, norm = 0.0;
+            for (let i = 0; i < octaves; i++) {
+                sum += amp * perlin.noise(x * freq, y * freq);
+                norm += amp;
+                amp *= gain;
+                freq *= lacunarity;
+            }
+            return sum / norm; // ~[-1,1]
+        }
+
+        // ===== Three.js setup =====
+        const app = document.getElementById('app');
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.shadowMap.enabled = true;
+        app.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0b1020);
+
+        const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 5000);
+        camera.position.set(300, 260, 300);
+        scene.add(camera);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI * 0.495;
+
+        // Lights
+        const hemi = new THREE.HemisphereLight(0x7aa6ff, 0x2e2e2e, 0.7);
+        scene.add(hemi);
+
+        const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+        dir.position.set(-300, 400, 200);
+        dir.castShadow = true;
+        dir.shadow.mapSize.set(2048, 2048);
+        const d = 500;
+        dir.shadow.camera.left = -d; dir.shadow.camera.right = d;
+        dir.shadow.camera.top = d; dir.shadow.camera.bottom = -d;
+        scene.add(dir);
+
+        // Ground (receive shadow)
+        const ground = new THREE.Mesh(
+            new THREE.PlaneBufferGeometry(4000, 4000),
+            new THREE.ShadowMaterial({ opacity: 0.15 })
+        );
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -1;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // ===== Terrain params & GUI =====
+        const params = {
+            width: 600, depth: 600, // kích thước mặt phẳng
+            segments: 256,          // độ phân giải (256 x 256)
+            amplitude: 80,          // biên độ đồi núi
+            frequency: 0.0035,      // tần số cơ sở (scale)
+            octaves: 5,             // số tầng fBm
+            lacunarity: 2.0,        // nhân tần số mỗi tầng
+            gain: 0.5,              // giảm biên độ mỗi tầng
+            seed: 1337,             // seed để tái tạo
+            wireframe: false,
+            flatShading: true,
+            metalness: 0.1,
+            roughness: 0.95,
+            autoRotate: false,
+            flow: false,            // làm địa hình “chảy” theo thời gian
+            flowSpeed: 0.08,        // tốc độ "chảy"
+            elevationBias: 0.0,     // đẩy toàn bộ cao độ lên/xuống
+            waterHeight: 0,   // cao độ mặt nước so với gốc toạ độ Y
+            Regenerate: () => buildTerrain(true)
+        };
+
+        const texLoader = new THREE.TextureLoader();
+        params.texture = texLoader.load('https://threejs.org/examples/textures/terrain/grasslight-big.jpg');
+
+        // Nút chọn ảnh
+        const fileInput = document.getElementById("textureInput");
+        fileInput.addEventListener("change", (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const url = URL.createObjectURL(file);
+            const loader = new THREE.TextureLoader();
+            loader.load(url, (texture) => {
+                texture.wrapS = THREE.ClampToEdgeWrapping;
+                texture.wrapT = THREE.ClampToEdgeWrapping;
+                texture.minFilter = THREE.LinearFilter;
+
+                const imgWidth = texture.image.width;
+                const imgHeight = texture.image.height;
+                const aspect = imgWidth / imgHeight;
+
+                const planeWidth = params.width;
+                const planeHeight = params.depth;
+                const planeAspect = planeWidth / planeHeight;
+
+                if (aspect > planeAspect) {
+                    // Ảnh rộng hơn plane
+                    const scale = planeAspect / aspect;
+                    texture.repeat.set(1, scale);
+                    texture.offset.set(0, (1 - scale) / 2);
+                } else {
+                    // Ảnh cao hơn plane
+                    const scale = aspect / planeAspect;
+                    texture.repeat.set(scale, 1);
+                    texture.offset.set((1 - scale) / 2, 0);
+                }
+
+                terrainMat.map = texture;
+                terrainMat.needsUpdate = true;
+            });
+        });
+
+        let perlin = makePerlin2D(params.seed);
+        let terrain, terrainGeom, terrainMat;
+        let time = 0;
+        let water;
+
+        function buildTerrain(newSeed = false) {
+            if (newSeed) {
+                params.seed = Math.floor(Math.random() * 1e9) >>> 0;
+                perlin = makePerlin2D(params.seed);
+            }
+            // Dispose old
+            if (terrain) {
+                terrain.geometry.dispose();
+                terrain.material.dispose();
+                scene.remove(terrain);
+            }
+            terrainGeom = new THREE.PlaneBufferGeometry(params.width, params.depth, params.segments, params.segments);
+            terrainGeom.rotateX(-Math.PI / 2);
+
+            // Tạo mảng màu cho từng vertex
+            const colors = [];
+            const position = terrainGeom.attributes.position;
+            for (let i = 0; i < position.count; i++) {
+                const y = position.getY(i); // dùng cao độ Y sau khi updateHeights
+                let color;
+                if (y < params.waterHeight) {
+                    color = new THREE.Color(0x003333);
+                } else {
+                    color = new THREE.Color(0xffffff);
+                }
+                colors.push(color.r, color.g, color.b);
+            }
+
+            terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+            terrainMat = new THREE.MeshStandardMaterial({
+                flatShading: params.flatShading,
+                wireframe: params.wireframe,
+                metalness: params.metalness,
+                roughness: params.roughness,
+                vertexColors: true   // bật dùng màu theo vertex
+            });
+
+
+            if (params.texture) {
+                terrainMat.map = params.texture;
+                terrainMat.map.wrapS = terrainMat.map.wrapT = THREE.RepeatWrapping;
+                terrainMat.map.repeat.set(8, 8);
+            }
+
+            terrain = new THREE.Mesh(terrainGeom, terrainMat);
+            terrain.castShadow = true;
+            terrain.receiveShadow = true;
+            scene.add(terrain);
+
+            // Gradient background
+            const canvas = document.createElement("canvas");
+            canvas.width = 1;
+            canvas.height = 256;
+            const ctx = canvas.getContext("2d");
+
+            // Tạo gradient từ xanh nhạt -> xanh đậm
+            const gradient = ctx.createLinearGradient(0, 0, 0, 256);
+            gradient.addColorStop(0, "#87ceeb");  // xanh trời
+            gradient.addColorStop(1, "#00111a");  // xanh đậm gần chân trời
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 1, 256);
+
+            const skyTexture = new THREE.CanvasTexture(canvas);
+            scene.background = skyTexture;
+
+            // Nước
+            if (water) {
+                water.geometry.dispose();
+                water.material.dispose();
+                scene.remove(water);
+                water = null;
+            }
+            const waterGeom = new THREE.BoxGeometry(params.width, params.depth);
+            water = new THREE.Water(waterGeom, {
+                textureWidth: 512,
+                textureHeight: 512,
+                waterNormals: new THREE.TextureLoader().load(
+                    "https://threejs.org/examples/textures/waternormals.jpg",
+                    function (texture) {
+                        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+                    }
+                ),
+                alpha: 1.0,
+                sunDirection: dir.position.clone().normalize(),
+                sunColor: 0xffffff,
+                waterColor: 0x001e0f,
+                distortionScale: 3.7,
+                fog: scene.fog !== undefined
+            });
+            water.rotation.x = -Math.PI / 2;      // đặt nằm ngang
+            water.position.y = params.waterHeight; // cao độ mặt nước
+            scene.add(water);
+
+            updateHeights(0);
+            updateColors();
+        }
+        function updateColors() {
+            const colors = [];
+            const position = terrainGeom.attributes.position;
+            for (let i = 0; i < position.count; i++) {
+                const y = position.getY(i);
+                let color;
+                if (y < params.waterHeight) {
+                    color = new THREE.Color(0x003333);
+                } else {
+                    color = new THREE.Color(0xffffff);
+                }
+                colors.push(color.r, color.g, color.b);
+            }
+            terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        }
+
+        function updateHeights(t) {
+            const pos = terrainGeom.attributes.position;
+            const arr = pos.array;
+
+            // Lấy thông tin lưới
+            const segX = params.segments;
+            const segZ = params.segments;
+            const halfW = params.width * 0.5;
+            const halfD = params.depth * 0.5;
+
+            // offset “flow” theo thời gian
+            const tOffset = params.flow ? t * params.flowSpeed : 0;
+
+            // Duyệt từng đỉnh: PlaneBufferGeometry sinh đỉnh theo trật tự đều
+            for (let iz = 0; iz <= segZ; iz++) {
+                for (let ix = 0; ix <= segX; ix++) {
+                    const i = ix + iz * (segX + 1);
+                    const i3 = i * 3;
+
+                    const x = arr[i3 + 0];
+                    const z = arr[i3 + 2];
+
+                    // Đưa x,z về không gian noise [dựa tần số]
+                    const nx = (x + tOffset * 80) * params.frequency;
+                    const nz = (z + tOffset * 80) * params.frequency;
+
+                    // fBm Perlin
+                    let h = fbm2(perlin, nx, nz, params.octaves, params.lacunarity, params.gain);
+                    // Nhấn mạnh đỉnh, nén đáy (mềm hơn)
+                    h = Math.sign(h) * Math.pow(Math.abs(h), 1.2);
+
+                    const y = h * params.amplitude + params.elevationBias;
+                    arr[i3 + 1] = y;
+                }
+            }
+
+            pos.needsUpdate = true;
+            terrainGeom.computeVertexNormals();
+            terrainGeom.normalsNeedUpdate = true;
+        }
+
+        // GUI
+        const gui = new dat.GUI();
+        const fTerrain = gui.addFolder('Terrain');
+        fTerrain.add(params, 'width', 100, 2000, 10).onFinishChange(() => buildTerrain(false));
+        fTerrain.add(params, 'depth', 100, 2000, 10).onFinishChange(() => buildTerrain(false));
+        fTerrain.add(params, 'segments', 32, 1024, 1).onFinishChange(() => buildTerrain(false));
+        fTerrain.add(params, 'amplitude', 1, 1000, 1);
+        fTerrain.add(params, 'frequency', 0.0005, 0.02, 0.0001);
+        fTerrain.add(params, 'octaves', 1, 8, 1);
+        fTerrain.add(params, 'lacunarity', 1.5, 3.5, 0.1);
+        fTerrain.add(params, 'gain', 0.2, 0.9, 0.01);
+        fTerrain.add(params, 'elevationBias', -100, 100, 1).onChange(v => {
+            updateHeights(time);
+        });
+        fTerrain.add(params, 'waterHeight', -100, 300, 1).onChange(v => {
+            if (water) water.position.y = v;
+            updateColors();
+        });
+        fTerrain.add(params, 'Regenerate');
+
+        const fMat = gui.addFolder('Material');
+        fMat.add(params, 'wireframe').onChange(v => { terrainMat.wireframe = v; terrainMat.needsUpdate = true; });
+        fMat.add(params, 'flatShading').onChange(v => { terrainMat.flatShading = v; terrainMat.needsUpdate = true; buildTerrain(false); });
+        fMat.add(params, 'metalness', 0, 1, 0.01).onChange(v => terrainMat.metalness = v);
+        fMat.add(params, 'roughness', 0, 1, 0.01).onChange(v => terrainMat.roughness = v);
+        fMat.add({ useTexture: true }, 'useTexture').name('Use Texture').onChange(v => {
+            if (v) {
+                terrainMat.map = params.texture;
+                terrainMat.map.wrapS = terrainMat.map.wrapT = THREE.RepeatWrapping;
+                terrainMat.map.repeat.set(8, 8);
+            } else {
+                terrainMat.map = null;
+            }
+            terrainMat.needsUpdate = true;
+        });
+        fMat.add({ chooseTexture: () => fileInput.click() }, 'chooseTexture').name("Choose Texture");
+
+
+        const fView = gui.addFolder('View');
+        fView.add(params, 'autoRotate');
+        fView.add(params, 'flow');
+        fView.add(params, 'flowSpeed', 0.0, 0.6, 0.01);
+
+        // Build first terrain
+        buildTerrain(false);
+
+        // Handle resize
+        addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+        // ===== Mini Map =====
+        const minimap = document.getElementById("minimap");
+        const ctxMap = minimap.getContext("2d");
+
+        let isDraggingMini = false;
+        let cameraTargetPos = new THREE.Vector3();
+        let isCameraMoving = false;
+
+        // Vẽ minimap
+        function drawMinimap() {
+            ctxMap.clearRect(0, 0, minimap.width, minimap.height);
+
+            // Vẽ biên địa hình
+            ctxMap.strokeStyle = "#0f0";
+            ctxMap.strokeRect(0, 0, minimap.width, minimap.height);
+
+            // Vẽ marker camera
+            const camX = (camera.position.x / params.width + 0.5) * minimap.width;
+            const camZ = (camera.position.z / params.depth + 0.5) * minimap.height;
+
+            ctxMap.fillStyle = "red";
+            ctxMap.beginPath();
+            ctxMap.arc(camX, camZ, 5, 0, Math.PI * 2);
+            ctxMap.fill();
+        }
+
+        // Chuyển đổi click trên minimap thành vị trí camera
+        function setCameraFromMinimap(mx, my) {
+            const nx = mx / minimap.width - 0.5;
+            const nz = my / minimap.height - 0.5;
+
+            cameraTargetPos.set(nx * params.width, camera.position.y, nz * params.depth);
+            isCameraMoving = true; // bật flag để bắt đầu lerp
+        }
+
+
+        minimap.addEventListener("mousedown", (e) => {
+            isDraggingMini = true;
+            const rect = minimap.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            setCameraFromMinimap(x, y);
+        });
+
+        minimap.addEventListener("mousemove", (e) => {
+            if (isCameraMoving) {
+                camera.position.lerp(cameraTargetPos, 0.05); // 0.05 = tốc độ lerp, tăng lên sẽ nhanh hơn
+                if (camera.position.distanceTo(cameraTargetPos) < 0.1) {
+                    camera.position.copy(cameraTargetPos);
+                    isCameraMoving = false;
+                }
+                controls.target.set(0, 0, 0); // luôn nhìn về gốc
+            }
+
+        });
+
+        window.addEventListener("mouseup", () => isDraggingMini = false);
+
+        // Animate
+        function tick(dt) {
+            requestAnimationFrame(tick);
+            const delta = dt ? dt * 0.001 : 0;   // rAF timestamp -> seconds
+            time += delta;
+
+            if (params.flow) updateHeights(time);
+            if (params.autoRotate) terrain.rotation.y += 0.05 * delta;
+
+            controls.update();
+            renderer.render(scene, camera);
+            drawMinimap();
+
+        }
+        requestAnimationFrame(tick);
+    </script>
+</body>
+
+</html>
